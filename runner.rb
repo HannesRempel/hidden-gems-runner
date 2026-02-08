@@ -32,11 +32,15 @@ HARD_LIMIT            = 0.200
 HARD_LIMIT_FIRST_TICK = 30.0
 OVERTIME_BUDGET       = 1.5
 
-OPTIONS_FOR_BOT = %w(stage_key width height generator max_ticks emit_signals vis_radius max_gems
-                     gem_spawn_rate gem_ttl signal_radius signal_cutoff signal_noise
+OPTIONS_FOR_BOT = %w(stage_key width height generator max_ticks emit_signals
+                     emit_signal_channels vis_radius max_gems gem_spawn_rate
+                     gem_ttl signal_radius signal_cutoff signal_noise
                      signal_quantization signal_fade enable_debug timeout_scale)
 
 ANSI = /\e\[[0-9;:<>?]*[@-~]/
+
+GAUGE = "⠀⡀⣀⣄⣤⣦⣶⣷⣿"
+GAUGE_COLORS = ['#ea2830', '#80bc42', '#55beed', '#fad31c', '#f384ae', '#00a8a8', '#7b67ae']
 
 $timings = Timings.new
 
@@ -74,6 +78,23 @@ if Gem.win_platform?
     end
 
     at_exit { flush_console_input_buffer }
+end
+
+def sanitize_utf8_values(obj, replacement: "�")
+    case obj
+    when String
+        return obj if obj.encoding == Encoding::UTF_8 && obj.valid_encoding?
+        obj.encode(Encoding::UTF_8, invalid: :replace, undef: :replace, replace: replacement)
+
+    when Array
+        obj.map { |v| sanitize_utf8_values(v, replacement: replacement) }
+
+    when Hash
+        obj.transform_values { |v| sanitize_utf8_values(v, replacement: replacement) }
+
+    else
+        obj
+    end
 end
 
 class Runner
@@ -141,14 +162,15 @@ class Runner
 
     def initialize(seed:, width:, height:, generator:, max_ticks:,
                    vis_radius:, gem_spawn_rate:, gem_ttl:, max_gems:,
-                   emit_signals:, signal_radius:, signal_quantization:,
-                   signal_noise:, signal_cutoff:, signal_fade:, swap_bots:,
-                   cache:, profile:, check_determinism:, use_docker:,
-                   docker_workdirs:, rounds:, round_seeds:, verbose:,
-                   max_tps:, announcer_enabled:, bot_chatter:,
-                   ansi_log_path:, write_highlights:, write_stdin:,
-                   show_timings:, start_paused:, contest_mode:,
-                   highlight_color:, enable_debug:, timeout_scale:
+                   emit_signals:, emit_signal_channels:,signal_radius:,
+                   signal_quantization:, signal_noise:, signal_cutoff:,
+                   signal_fade:, swap_bots:, cache:, profile:,
+                   check_determinism:, use_docker:, docker_workdirs:,
+                   rounds:, round_seeds:, verbose:, max_tps:,
+                   announcer_enabled:, bot_chatter:, ansi_log_path:,
+                   write_highlights:, write_stdin:, show_timings:,
+                   start_paused:, contest_mode:, highlight_color:,
+                   enable_debug:, timeout_scale:
                    )
         @seed = seed
         @width = width
@@ -160,6 +182,7 @@ class Runner
         @gem_ttl = gem_ttl
         @max_gems = max_gems
         @emit_signals = emit_signals
+        @emit_signal_channels = emit_signal_channels
         @signal_radius = signal_radius
         @signal_quantization = signal_quantization
         @signal_noise = signal_noise
@@ -180,6 +203,7 @@ class Runner
         @gems = []
         @gems_spawned = 0
         @gem_id_for_offset = {}
+        @gem_channel_for_gem_id = {}
         @chatlog = []
         @stage_title = '(no stage)'
         @stage_key = '(no stage)'
@@ -202,7 +226,7 @@ class Runner
 
         param_rng = PCG32.new(@seed)
         [:width, :height, :max_ticks, :vis_radius, :gem_ttl, :max_gems,
-         :signal_radius, :rounds].each do |_key|
+         :signal_radius, :signal_fade, :rounds].each do |_key|
             key = "@#{_key}".to_sym
             value = instance_variable_get(key)
             if value.is_a?(String) && value.include?('..')
@@ -211,7 +235,7 @@ class Runner
                 instance_variable_set(key, new_value)
             end
         end
-        [:gem_spawn_rate].each do |_key|
+        [:gem_spawn_rate, :signal_noise].each do |_key|
             key = "@#{_key}".to_sym
             value = instance_variable_get(key)
             if value.is_a?(String) && value.include?('..')
@@ -720,7 +744,11 @@ class Runner
                                 end
                                 if @emit_signals
                                     if signal_level[i].include?((y << 16) | x)
-                                        bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - signal_level[i][(y << 16) | x])
+                                        level = signal_level[i][(y << 16) | x]
+                                        # clamp signal level for rendering
+                                        level = 0.0 if level < 0.0
+                                        level = 1.0 if level > 1.0
+                                        bg = mix_rgb_hex(GEM_COLOR, bg, 1.0 - level)
                                     end
                                 end
                             end
@@ -795,7 +823,7 @@ class Runner
             end
 
             $timings.profile("render: lower status bar") do
-                status_line = [
+                status_line_parts = [
                     [
                         Paint['  ', fg_bottom_mix, UI_BACKGROUND_BOTTOM],
                         Paint['[Q]', UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM],
@@ -813,10 +841,45 @@ class Runner
                         Paint['[Home]', UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM],
                         Paint[' Rewind', fg_bottom_mix, UI_BACKGROUND_BOTTOM],
                     ],
-                    [
-                        Paint[@bots.map.with_index { |x, i| "#{x[:emoji]} #{((@protocol[i][-2] || {})[:bots] || {})[:response]}" }.join(' : '), UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
-                    ],
-                ].map { |x| x.join('') }.join(Paint['  |  ', fg_bottom_mix, UI_BACKGROUND_BOTTOM])
+                ]
+                bot_line = @bots.map.with_index do |x, i|
+                    parts = []
+                    if (i > 0)
+                        parts << Paint[' : ', fg_bottom_mix, UI_BACKGROUND_BOTTOM]
+                    end
+                    parts << Paint["#{x[:emoji]}", UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
+                    if @emit_signal_channels
+                        (0...@max_gems).each.with_index do |c, ci|
+                            signal_level = ((((@protocol[i][-2] || {})[:bots] || {})[:data] || {})[:channels] || [])[c] || 0.0
+                            signal_level = 0.0 if signal_level < 0.0
+                            signal_level = 1.0 if signal_level > 1.0
+                            signal_level = signal_level ** 0.5
+                            gauge_character = GAUGE[[(signal_level * (GAUGE.size - 1)).round, GAUGE.size - 1].min]
+                            parts << Paint[" #{gauge_character}", GAUGE_COLORS[ci % GAUGE_COLORS.size], UI_BACKGROUND_BOTTOM]
+                        end
+                    end
+                    parts << Paint[" #{((@protocol[i][-2] || {})[:bots] || {})[:response]}", UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
+                    parts
+                end
+                status_line_parts << bot_line
+                # status_line_parts << [
+                #     Paint[@bots.map.with_index { |x, i| "#{x[:emoji]} #{((@protocol[i][-2] || {})[:bots] || {})[:response]}" }.join(' : '), UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
+                # ]
+                # if @emit_signal_channels
+                #     status_line_parts << [
+                #         Paint[@bots.map.with_index { |x, i| "#{x[:emoji]} #{((@protocol[i][-2] || {})[:bots] || {})[:response]}" }.join(' : '), UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
+                #         Paint['Signal: ', UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM],
+                #         Paint['⣦', '#ea2830', UI_BACKGROUND_BOTTOM],
+                #         Paint[' ', UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM],
+                #         Paint['⣀', '#80bc42', UI_BACKGROUND_BOTTOM],
+                #         Paint[' ', UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM],
+                #         Paint['⣷', '#55beed', UI_BACKGROUND_BOTTOM],
+                #         Paint[@bots.map.with_index { |x, i| "#{x[:emoji]} #{((@protocol[i][-2] || {})[:bots] || {})[:response]}" }.join(' : '), UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
+                #     ]
+                # else
+                # end
+                # glyph = ["⠀","⡀","⣀","⣄","⣤","⣦","⣶","⣷","⣿"][level]
+                status_line = status_line_parts.map { |x| x.join('') }.join(Paint['  |  ', fg_bottom_mix, UI_BACKGROUND_BOTTOM])
                 trimmed, vis = trim_ansi_to_width(status_line, @terminal_width)
                 status_line = trimmed + Paint[' ' * [@terminal_width - vis, 0].max, UI_FOREGROUND_BOTTOM, UI_BACKGROUND_BOTTOM]
                 io.print status_line
@@ -950,10 +1013,20 @@ class Runner
             gem[:level] = level
         end
 
-        @gems << gem
         @gems_spawned += 1
         gem[:id] = @gems_spawned - 1
         @gem_id_for_offset[gem[:position_offset]] = gem[:id]
+        if @emit_signal_channels
+            # find free channel
+            available_channels = Set.new((0...@max_gems).to_a)
+            @gems.each do |g|
+                channel = @gem_channel_for_gem_id[g[:id]]
+                available_channels.delete(channel) if channel
+            end
+            channel = @rng.sample(available_channels.to_a.sort)
+            @gem_channel_for_gem_id[gem[:id]] = channel
+        end
+        @gems << gem
         return gem[:ttl]
     end
 
@@ -1138,16 +1211,8 @@ class Runner
                     # STEP 1: Calculate signal levels at each tile
                     if @emit_signals
                         signal_level = @gems.map do |gem|
-                            temp = if @signal_noise > 0.0
-                                gem[:level].transform_values do |l|
-                                    l += (@rng.next_float() - 0.5) * 2.0 * @signal_noise
-                                    l = 0.0 if l < 0.0
-                                    l = 1.0 if l > 1.0
-                                    l
-                                end
-                            else
-                                gem[:level]
-                            end
+                            # fade first
+                            temp = gem[:level]
                             if @signal_fade > 0
                                 t = 1.0
                                 gem_age = @gem_ttl - gem[:ttl]
@@ -1160,6 +1225,16 @@ class Runner
                                 t = 1.0 if t > 1.0
                                 if t < 1.0
                                     temp = temp.transform_values { |x| x * t }
+                                end
+                            end
+                            # add noise after fading
+                            if @signal_noise > 0.0
+                                temp = temp.transform_values do |l|
+                                    l += (@rng.next_float() - 0.5) * 2.0 * @signal_noise
+                                    # no clamping of raw noisy signals, we'll only clamp for rendering later
+                                    # l = 0.0 if l < 0.0
+                                    # l = 1.0 if l > 1.0
+                                    l
                                 end
                             end
                             temp
@@ -1288,6 +1363,15 @@ class Runner
                                     level_sum += (signal_level[gi][vis_key] || 0.0)
                                 end
                                 data[:signal_level] = format("%.6f", level_sum).to_f
+                                if @emit_signal_channels
+                                    data[:channels] = (0...@max_gems).map { |c| 0.0 }
+                                    @gems.each.with_index do |g, gi|
+                                        gem_id = g[:id]
+                                        channel = @gem_channel_for_gem_id[gem_id]
+                                        level = signal_level[gi][vis_key] || 0.0
+                                        data[:channels][channel] = format("%.6f", level).to_f
+                                    end
+                                end
                             end
                             if @bots.size > 1
                                 data[:visible_bots] = []
@@ -1521,6 +1605,9 @@ class Runner
                         end
                         collected_gems.reverse.each do |i|
                             @gem_id_for_offset.delete(@gems[i][:position_offset])
+                            if @emit_signal_channels
+                                @gem_channel_for_gem_id.delete(@gems[i][:id])
+                            end
                             @gems.delete_at(i)
                         end
                         @gems.each.with_index do |gem, i|
@@ -1532,6 +1619,9 @@ class Runner
                         @gems.each do |gem|
                             if gem[:ttl] <= 0
                                 @gem_id_for_offset.delete(gem[:position_offset])
+                                if @emit_signal_channels
+                                    @gem_channel_for_gem_id.delete(gem[:id])
+                                end
                             end
                         end
                         @gems.reject! do |gem|
@@ -1680,6 +1770,7 @@ options = {
     max_tps: 15,
     cache: false,
     emit_signals: false,
+    emit_signal_channels: false,
     profile: false,
     check_determinism: false,
     use_docker: false,
@@ -1782,6 +1873,9 @@ OptionParser.new do |opts|
     end
     opts.on("-e", "--[no-]emit-signals", "Enable gem signals (default: #{options[:emit_signals]})") do |x|
         options[:emit_signals] = x
+    end
+    opts.on("--[no-]emit-signal-channels", "Enable gem signal channels (default: #{options[:emit_signal_channels]})") do |x|
+        options[:emit_signal_channels] = x
     end
     opts.on("--signal-radius N", Float, "Gem signal radius (default: #{options[:signal_radius]})") do |x|
         options[:signal_radius] = x
@@ -1989,7 +2083,10 @@ if options[:rounds] == 1
             report[:timestamp] = Time.now.to_i
             report[:stage_key] = stage_key
             report[:stage_title] = stage_title
-            report[:git_hash] = `git describe --always --dirty`.strip
+            begin
+                report[:git_hash] = `git describe --always --dirty`.strip
+            rescue
+            end
             report[:seed] = og_seed.to_s(36)
             report[:name] = bot[:name]
             report[:emoji] = bot[:emoji]
@@ -2020,7 +2117,7 @@ if options[:rounds] == 1
         end
 
         File.open(write_profile_json_path, 'w') do |f|
-            f.write(all_reports.to_json)
+            f.write(sanitize_utf8_values(all_reports).to_json)
         end
 
         events_path = write_profile_json_path.sub(/\.json\z/, "-events.json.gz")
@@ -2100,7 +2197,10 @@ else
         report[:timestamp] = Time.now.to_i
         report[:stage_key] = stage_key
         report[:stage_title] = stage_title
-        report[:git_hash] = `git describe --always --dirty`.strip
+        begin
+            report[:git_hash] = `git describe --always --dirty`
+        rescue
+        end
         report[:seed] = og_seed.to_s(36)
         report[:name] = data[:name]
         report[:emoji] = data[:emoji]
@@ -2133,7 +2233,7 @@ else
         events_path = write_profile_json_path.sub(/\.json\z/, "-events.json.gz")
         FileUtils.mkdir_p(File.dirname(events_path))
         Zlib::GzipWriter.open(events_path) do |gz|
-            gz.write({ events: all_events }.to_json)
+            gz.write({ events: sanitize_utf8_values(all_events) }.to_json)
         end
     end
 end
